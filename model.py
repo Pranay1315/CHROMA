@@ -1,28 +1,28 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torchvision.transforms as transforms
+import torchvision.utils as vutils
 import numpy as np
 import os
-import cv2
 import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader, Dataset
+from PIL import Image
 
 # Paths (These paths are specific to your local machine)
 path_train = "./Dataset/train_black/"
-path_target = "./Dataset/train_color/"  
+path_target = "./Dataset/train_color/"
 checkpoint_folder = "./Dataset/checkpoints/"
 
 # Device configuration
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # Hyperparameters
-LEARNING_RATE = 2e-4
+LEARNING_RATE = 1e-4
 BATCH_SIZE = 16
 IMAGE_SIZE = 256
 CHANNELS_IMG = 3
-L1_LAMBDA = 100
-NUM_EPOCHS = 50
+L1_LAMBDA = 50
+NUM_EPOCHS = 200
 
 # Ensure checkpoint directory exists
 os.makedirs(checkpoint_folder, exist_ok=True)
@@ -41,52 +41,45 @@ class ImageColorizationDataset(Dataset):
     def __getitem__(self, idx):
         img_name = os.path.join(self.train_dir, self.train_images[idx])
         target_name = os.path.join(self.target_dir, self.train_images[idx])
-        input_img = cv2.imread(img_name)
-        target_img = cv2.imread(target_name)
-
-        if input_img is None or target_img is None:
-            print(f"Error loading image: {img_name} or {target_name}")
-            return None, None
+        
+        # Using PIL to open the images
+        input_img = Image.open(img_name).convert("RGB")
+        target_img = Image.open(target_name).convert("RGB")
 
         if self.transform:
             input_img, target_img = self.transform(input_img, target_img)
 
         # Ensure images are not None before transposing
         if input_img is not None and target_img is not None:
-            return input_img.astype(np.float32).transpose(2, 0, 1), target_img.astype(np.float32).transpose(2, 0, 1)
+            return np.array(input_img).astype(np.float32).transpose(2, 0, 1), np.array(target_img).astype(np.float32).transpose(2, 0, 1)
         else:
             return None, None
 
-# Data augmentation
+# Data augmentation using PIL
 def random_jitter(input_img, tar_img):
-    # Resize to a fixed size BEFORE cropping
-    input_img = cv2.resize(input_img, (286, 286))
-    tar_img = cv2.resize(tar_img, (286, 286))
+    # Resize to a fixed size BEFORE cropping using PIL
+    input_img = input_img.resize((286, 286))
+    tar_img = tar_img.resize((286, 286))
 
     # Generate random coordinates for cropping
     crop_x = np.random.randint(0, 286 - 256)
     crop_y = np.random.randint(0, 286 - 256)
 
     # Crop both images using the same coordinates
-    input_img = input_img[crop_y:crop_y + 256, crop_x:crop_x + 256]
-    tar_img = tar_img[crop_y:crop_y + 256, crop_x:crop_x + 256]
+    input_img = input_img.crop((crop_x, crop_y, crop_x + 256, crop_y + 256))
+    tar_img = tar_img.crop((crop_x, crop_y, crop_x + 256, crop_y + 256))
 
     if np.random.rand() > 0.5:
-        input_img = cv2.flip(input_img, 1)
-        tar_img = cv2.flip(tar_img, 1)
+        input_img = input_img.transpose(Image.FLIP_LEFT_RIGHT)
+        tar_img = tar_img.transpose(Image.FLIP_LEFT_RIGHT)
 
-    return input_img, tar_img
-
-def load_image(filename):
-    input_img = cv2.imread(os.path.join(path_train, filename))
-    tar_img = cv2.imread(os.path.join(path_target, filename))
     return input_img, tar_img
 
 class Transforms:
     def __call__(self, inp, tar):
         inp, tar = random_jitter(inp, tar)
-        inp = (inp / 255.0) * 2 - 1
-        tar = (tar / 255.0) * 2 - 1
+        inp = (np.array(inp) / 255.0) * 2 - 1  # Convert to numpy array for torch compatibility
+        tar = (np.array(tar) / 255.0) * 2 - 1  # Convert to numpy array for torch compatibility
         return inp, tar
 
 # Define the Generator model
@@ -211,8 +204,13 @@ def train_step(input_image, target):
         output_image = generator(input_image)
         disc_real = discriminator(input_image, target)
         disc_fake = discriminator(input_image, output_image.detach())
-        loss_disc_real = loss_GAN(disc_real, torch.ones_like(disc_real))
-        loss_disc_fake = loss_GAN(disc_fake, torch.zeros_like(disc_fake))
+
+         # Apply label smoothing
+        real_labels = torch.ones_like(disc_real) * 0.9  # Smooth real labels
+        fake_labels = torch.zeros_like(disc_fake) + 0.1  # Smooth fake labels
+
+        loss_disc_real = loss_GAN(disc_real, real_labels)
+        loss_disc_fake = loss_GAN(disc_fake, fake_labels)
         loss_disc = (loss_disc_real + loss_disc_fake) / 2
 
     opt_disc.zero_grad()
@@ -232,9 +230,54 @@ def train_step(input_image, target):
 
     return loss_disc.item(), loss_gen.item()
 
+# Function to save sample images
+def save_sample_images(epoch, generator, dataloader, device, save_dir="./samples"):
+    os.makedirs(save_dir, exist_ok=True)
+
+    generator.eval()  # Set to evaluation mode
+    with torch.no_grad():
+        for idx, (input_image, _) in enumerate(dataloader):
+            input_image = input_image.to(device)
+            colorized_image = generator(input_image)
+
+            # Convert from [-1, 1] to [0, 1] range
+            colorized_image = (colorized_image + 1) / 2
+
+            # Convert tensor to PIL image
+            colorized_image = colorized_image[0].cpu().detach().numpy().transpose(1, 2, 0)  # Convert to HWC
+            colorized_image = np.uint8(colorized_image * 255)
+
+            pil_image = Image.fromarray(colorized_image)
+            pil_image.save(os.path.join(save_dir, f"epoch_{epoch}sample{idx}.png"))
+            
+            # Display using matplotlib
+            # plt.figure(figsize=(8, 8))
+            # plt.axis("off")
+            # plt.title(f"Generated Image - Epoch {epoch}")
+            # plt.imshow(colorized_image)
+            # plt.show()
+
+            if idx == 0:  # Show only the first batch
+                break
+
+    generator.train()
+
+def load_checkpoint(model, optimizer, checkpoint_path):
+    if os.path.exists(checkpoint_path):
+        checkpoint = torch.load(checkpoint_path)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        epoch = checkpoint['epoch']
+        print(f"Loaded checkpoint from {checkpoint_path} at epoch {epoch}")
+        return epoch
+    return 0
+
 # Training loop
 def train():
-    for epoch in range(NUM_EPOCHS):
+    # start_epoch = load_checkpoint(generator, opt_gen, os.path.join(checkpoint_folder, "generator_latest.pth"))
+    # load_checkpoint(discriminator, opt_disc, os.path.join(checkpoint_folder, "discriminator_latest.pth"))
+    start_epoch = 0
+    for epoch in range(start_epoch, NUM_EPOCHS):
         for idx, (input_image, target) in enumerate(dataloader):
             # Check if the images are valid
             if input_image is None or target is None:
@@ -249,11 +292,22 @@ def train():
 
         # Save checkpoints
         if epoch % 5 == 0:
-            torch.save(generator.state_dict(), os.path.join(checkpoint_folder, f"generator_epoch_{epoch}.pth"))
-            torch.save(discriminator.state_dict(), os.path.join(checkpoint_folder, f"discriminator_epoch_{epoch}.pth"))
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': generator.state_dict(),
+                'optimizer_state_dict': opt_gen.state_dict(),
+            }, os.path.join(checkpoint_folder, "generator_latest.pth"))
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': discriminator.state_dict(),
+                'optimizer_state_dict': opt_disc.state_dict(),
+            }, os.path.join(checkpoint_folder, "discriminator_latest.pth"))
+        
+        # Save sample images every 5 epochs
+        if epoch % 5 == 0:
+            save_sample_images(epoch, generator, dataloader, device)
 
     print("Training complete!")
 
-# Ensure trainig only runs when executing model.py directly
 if __name__ == "__main__":
     train()
